@@ -1,0 +1,5 @@
+# Python dependencies (Tkinter comes with Python)
+pandas>=2.2
+matplotlib>=3.9
+seaborn>=0.13
+pytest>=8
