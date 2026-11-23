@@ -1,20 +1,23 @@
 """Command-line cleaning pipeline: python -m datastudio.pipeline FILE [options].
 
-Writes cleaned.csv, report.txt (before/after) and audit_log.csv to the output
-directory. Order of steps: full duplicates -> range rules -> missing values ->
+Writes cleaned.csv, report.txt (before/after, with correlations) and
+audit_log.csv to the output directory; with --chart also before/after charts in
+output/charts. Order of steps: full duplicates -> range rules -> missing values ->
 outliers. Range violations become missing values by default, so the next step
 can fill them. Outliers are only counted unless columns are named explicitly.
 """
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
 
-from datastudio import profile
-from datastudio.errors import DataStudioError, RuleError
+from datastudio import charts, profile
+from datastudio.charts import ChartSpec
+from datastudio.errors import ColumnError, DataStudioError, RuleError
 from datastudio.session import BOUND_ACTIONS, DataSession
 
 MISSING_STRATEGIES = ("median", "mean", "mode", "drop")
@@ -35,6 +38,8 @@ class PipelineConfig:
     outlier_columns: tuple[str, ...] = ()
     outlier_action: str = "flag"
     iqr_factor: float = 1.5
+    charts: tuple[ChartSpec, ...] = ()
+    chart_formats: tuple[str, ...] = ("png",)
 
 
 def parse_range(text: str) -> RangeRule:
@@ -48,6 +53,19 @@ def parse_range(text: str) -> RangeRule:
             f"Niepoprawna reguła zakresu: {text}",
             "Użyj formatu KOLUMNA:MIN:MAX, np. housing_median_age:0:100.",
         ) from error
+
+
+def parse_chart(text: str) -> ChartSpec:
+    """Parse KIND[:X[:Y]]; an empty X or Y means no column on that axis."""
+    kind, *columns = text.split(":")
+    if len(columns) > 2:
+        raise RuleError(
+            f"Niepoprawny opis wykresu: {text}",
+            "Użyj formatu RODZAJ:X:Y, np. scatter:median_income:median_house_value.",
+        )
+    charts.get_chart_type(kind)
+    x, y = (columns + [""] * 2)[:2]
+    return ChartSpec(kind, x or None, y or None)
 
 
 def quality_findings(session: DataSession, config: PipelineConfig) -> list[str]:
@@ -93,7 +111,22 @@ def table_section(title: str, frame: pd.DataFrame) -> list[str]:
         "",
         profile.describe_numeric(frame).to_string(),
         "",
+        "Najsilniejsze korelacje (Pearson):",
+        *correlation_lines(frame),
+        "",
     ]
+
+
+def correlation_lines(frame: pd.DataFrame) -> list[str]:
+    try:
+        return charts.correlation_summary(frame)
+    except ColumnError as error:
+        return [error.message]
+
+
+def chart_name(index: int, spec: ChartSpec) -> str:
+    parts = [f"{index:02d}", spec.kind, spec.x or "", spec.y or ""]
+    return re.sub(r"[^\w-]+", "_", "_".join(part for part in parts if part))
 
 
 def build_report(source: Path, session: DataSession, findings: list[str]) -> str:
@@ -114,6 +147,11 @@ def run(source: Path, output: Path, config: PipelineConfig) -> DataSession:
     session = DataSession.from_csv(source)
     findings = quality_findings(session, config)
     clean(session, config)
+    # Charts are built before anything is written, so a wrong chart leaves no partial output.
+    figures = [
+        (chart_name(index, spec), charts.before_after_chart(session.raw, session.current, spec))
+        for index, spec in enumerate(config.charts, start=1)
+    ]
     try:
         output.mkdir(parents=True, exist_ok=True)
         session.current.to_csv(output / "cleaned.csv", index=False, encoding="utf-8-sig")
@@ -124,6 +162,9 @@ def run(source: Path, output: Path, config: PipelineConfig) -> DataSession:
             f"Nie można zapisać wyników w {output}: {error}",
             "Zamknij pliki otwarte w innym programie albo wybierz inny katalog.",
         ) from error
+    for name, figure in figures:
+        for fmt in config.chart_formats:
+            charts.save_figure(figure, output / "charts" / f"{name}.{fmt}")
     return session
 
 
@@ -137,6 +178,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--outlier-columns", nargs="*", default=[], help="kolumny, w których obsłużyć outliery")
     parser.add_argument("--outlier-action", choices=BOUND_ACTIONS, default="flag")
     parser.add_argument("--iqr-factor", type=float, default=1.5)
+    parser.add_argument(
+        "--chart", action="append", default=[], metavar="RODZAJ:X:Y", help="wykres przed/po (można podać kilka)"
+    )
+    parser.add_argument("--chart-formats", nargs="+", choices=charts.EXPORT_FORMATS, default=["png"])
     return parser.parse_args(argv)
 
 
@@ -150,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             outlier_columns=tuple(args.outlier_columns),
             outlier_action=args.outlier_action,
             iqr_factor=args.iqr_factor,
+            charts=tuple(parse_chart(text) for text in args.chart),
+            chart_formats=tuple(args.chart_formats),
         )
         session = run(args.source, args.output, config)
     except DataStudioError as error:

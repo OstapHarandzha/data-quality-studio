@@ -19,3 +19,9 @@ def test_pipeline_writes_cleaned_csv_and_audit_log(tmp_path):
 
     audit = pd.read_csv(tmp_path / "audit_log.csv")
     assert list(audit["affected"]) == [1, 1, 1, 2, 1]
+
+
+def test_pipeline_saves_before_after_charts(tmp_path):
+    source = SAMPLES / "housing_comma.csv"
+    assert main([str(source), "--output", str(tmp_path), "--chart", "histogram:median_income"]) == 0
+    assert (tmp_path / "charts" / "01_histogram_median_income.png").exists()
